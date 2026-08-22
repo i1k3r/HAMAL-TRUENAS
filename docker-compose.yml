@@ -1,7 +1,7 @@
 services:
   hamal:
     build: .
-    image: ghcr.io/i1k3r/hamal:latest
+    image: ghcr.io/i1k3r/hamal-truenas:latest
     container_name: hamal
     ports:
       - "7700:7700"

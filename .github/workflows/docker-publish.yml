@@ -35,7 +35,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/i1k3r/hamal
+            ghcr.io/i1k3r/hamal-truenas
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=tag
@@ -44,9 +44,9 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,prefix=sha-,format=short
           labels: |
-            org.opencontainers.image.title=HAMAL
-            org.opencontainers.image.description=Point-to-point local file transfer. The carrier for your digital cargo.
-            org.opencontainers.image.source=https://github.com/i1k3r/HAMAL
+            org.opencontainers.image.title=HAMAL-TRUENAS
+            org.opencontainers.image.description=Point-to-point local file transfer for TrueNAS SCALE. The carrier for your digital cargo.
+            org.opencontainers.image.source=https://github.com/i1k3r/HAMAL-TRUENAS
             org.opencontainers.image.vendor=i1k3r
             org.opencontainers.image.licenses=MIT
 
