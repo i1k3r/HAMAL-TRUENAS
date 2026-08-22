@@ -1,0 +1,18 @@
+services:
+  hamal:
+    image: ghcr.io/i1k3r/hamal-truenas:latest
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${HAMAL_PORT:-7700}:7700"
+    volumes:
+      # Replace /mnt/YOUR_POOL/appdata/hamal with the absolute path to your TrueNAS ZFS dataset.
+      # Ensure UID 10001 / GID 10001 has read and write permissions on this dataset.
+      - ${HAMAL_DATA_PATH:-/mnt/YOUR_POOL/appdata/hamal}:/data
+    tmpfs:
+      - /tmp:size=64M,mode=1777
+    environment:
+      - TZ=${TZ:-Europe/Istanbul}
