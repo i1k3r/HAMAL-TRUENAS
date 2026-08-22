@@ -1,0 +1,20 @@
+services:
+  hamal:
+    build: .
+    image: ghcr.io/i1k3r/hamal:latest
+    container_name: hamal
+    ports:
+      - "7700:7700"
+    env_file:
+      - .env
+    volumes:
+      - hamal-data:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  hamal-data:
