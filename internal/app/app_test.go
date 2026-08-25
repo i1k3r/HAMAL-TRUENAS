@@ -3693,3 +3693,94 @@ func TestParticipantPINAuthenticationFlowAndRedirect(t *testing.T) {
 		t.Fatalf("expected 200 on reopen with cookie, got %d", reopenResp.StatusCode)
 	}
 }
+
+func TestParticipantManyFilesLayoutAndScrolling(t *testing.T) {
+	a := testApp(t)
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	// 1. Verify /static/site.css has clean vertical scrolling on html/body and overflow: visible on mobile-frame
+	cssResp, err := http.Get(ts.URL + "/static/site.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cssResp.Body.Close()
+	if cssResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from site.css, got %d", cssResp.StatusCode)
+	}
+	cssBytes, _ := io.ReadAll(cssResp.Body)
+	cssCode := string(cssBytes)
+	if strings.Contains(cssCode, "html, body {\n  width: 100%;\n  height: 100%;\n  background-color: var(--bg-app);\n  color: var(--text-primary);\n  font-family: var(--font-sans);\n  font-size: 14px;\n  line-height: 1.45;\n  -webkit-font-smoothing: antialiased;\n  -moz-osx-font-smoothing: grayscale;\n  overflow: hidden;\n}") {
+		t.Error("site.css still has overflow: hidden on html, body")
+	}
+
+	// 2. Create room
+	createResp, err := http.Post(ts.URL+"/api/v1/rooms", "application/json", strings.NewReader(`{"ttl_seconds": 3600}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createResp.Body.Close()
+	var roomData struct {
+		RoomID           string `json:"room_id"`
+		ParticipantToken string `json:"participant_token"`
+	}
+	_ = json.NewDecoder(createResp.Body).Decode(&roomData)
+
+	// 3. Upload 30 files to simulate large room list
+	const fileCount = 30
+	for i := 1; i <= fileCount; i++ {
+		var b bytes.Buffer
+		w := multipart.NewWriter(&b)
+		filename := fmt.Sprintf("truenas_package_%02d.bin", i)
+		fw, err := w.CreateFormFile("file", filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fw.Write([]byte(fmt.Sprintf("data for package %d", i)))
+		w.Close()
+
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/files", &b)
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		upResp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("failed to upload file %d: %v", i, err)
+		}
+		upResp.Body.Close()
+		if upResp.StatusCode != http.StatusCreated && upResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 201/200 for file %d, got %d", i, upResp.StatusCode)
+		}
+	}
+
+	// 4. Verify participant HTML renders all files and bottom close action
+	pHtmlResp, err := http.Get(ts.URL + "/r/" + roomData.ParticipantToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pHtmlResp.Body.Close()
+	pHtmlBytes, _ := io.ReadAll(pHtmlResp.Body)
+	pHtml := string(pHtmlBytes)
+	if !strings.Contains(pHtml, "participant-close-btn") {
+		t.Error("participant HTML missing participant-close-btn")
+	}
+	if !strings.Contains(pHtml, "truenas_package_30.bin") {
+		t.Error("participant HTML missing 30th file")
+	}
+
+	// 5. Verify all 30 files are listable
+	listResp, err := http.Get(ts.URL + "/api/v1/rooms/" + roomData.ParticipantToken + "/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResp.Body.Close()
+	var listData struct {
+		Files []struct {
+			FileID   string `json:"file_id"`
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	_ = json.NewDecoder(listResp.Body).Decode(&listData)
+	if len(listData.Files) != fileCount {
+		t.Fatalf("expected %d files, got %d", fileCount, len(listData.Files))
+	}
+}
