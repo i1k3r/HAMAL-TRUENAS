@@ -3275,3 +3275,288 @@ func TestParticipantAuthenticationWithHardenedCookie(t *testing.T) {
 		t.Fatalf("expected 200 with session cookie, got %d", filesRespAuth.StatusCode)
 	}
 }
+
+func TestParticipantCloseRoomLifecycle(t *testing.T) {
+	a := testApp(t)
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	// 1. Creator creates room
+	createResp, err := http.Post(ts.URL+"/api/v1/rooms", "application/json", strings.NewReader(`{"ttl_seconds": 3600}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createResp.Body.Close()
+
+	var roomData struct {
+		RoomID           string `json:"room_id"`
+		CreatorToken     string `json:"creator_token"`
+		ParticipantToken string `json:"participant_token"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&roomData); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Participant views HTML -> contains Close Room, confirm modal, and room-closing-card
+	partViewResp, err := http.Get(ts.URL + "/r/" + roomData.ParticipantToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer partViewResp.Body.Close()
+	if partViewResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on participant page, got %d", partViewResp.StatusCode)
+	}
+	partHTML, _ := io.ReadAll(partViewResp.Body)
+	if !strings.Contains(string(partHTML), "participant-close-btn") {
+		t.Fatal("expected participant HTML to contain participant-close-btn")
+	}
+	if !strings.Contains(string(partHTML), "close-confirm-modal") {
+		t.Fatal("expected participant HTML to contain close-confirm-modal")
+	}
+	if !strings.Contains(string(partHTML), "room-closing-card") {
+		t.Fatal("expected participant HTML to contain room-closing-card")
+	}
+
+	// 3. Participant calls close endpoint -> enters CLOSING state with 10s deadline
+	closeResp, err := http.Post(ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/close", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeResp.Body.Close()
+	if closeResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on participant close, got %d", closeResp.StatusCode)
+	}
+
+	var closeResult struct {
+		Status                  string `json:"status"`
+		CloseDeadline           string `json:"close_deadline"`
+		ClosingRemainingSeconds int    `json:"closing_remaining_seconds"`
+		RemainingSeconds        int    `json:"remaining_seconds"`
+	}
+	if err := json.NewDecoder(closeResp.Body).Decode(&closeResult); err != nil {
+		t.Fatal(err)
+	}
+	if closeResult.Status != "closing" {
+		t.Fatalf("expected status 'closing', got %v", closeResult.Status)
+	}
+	if closeResult.CloseDeadline == "" {
+		t.Fatal("expected non-empty close_deadline")
+	}
+	if closeResult.ClosingRemainingSeconds <= 0 || closeResult.ClosingRemainingSeconds > 10 {
+		t.Fatalf("expected closing_remaining_seconds between 1 and 10, got %d", closeResult.ClosingRemainingSeconds)
+	}
+
+	// 4. Repeated close requests do NOT reset or extend countdown (idempotency check)
+	reCloseResp, err := http.Post(ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/close", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reCloseResp.Body.Close()
+	var reCloseResult struct {
+		Status        string `json:"status"`
+		CloseDeadline string `json:"close_deadline"`
+	}
+	_ = json.NewDecoder(reCloseResp.Body).Decode(&reCloseResult)
+	if reCloseResult.Status != "closing" {
+		t.Fatalf("expected status 'closing' on repeat call, got %v", reCloseResult.Status)
+	}
+	if reCloseResult.CloseDeadline != closeResult.CloseDeadline {
+		t.Fatalf("expected deadline to remain %v, got %v", closeResult.CloseDeadline, reCloseResult.CloseDeadline)
+	}
+
+	// 5. During CLOSING: Creator and Participant polling reports status: "closing"
+	creatorPollResp, err := http.Get(ts.URL + "/api/v1/rooms/" + roomData.CreatorToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer creatorPollResp.Body.Close()
+	if creatorPollResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for creator poll during closing, got %d", creatorPollResp.StatusCode)
+	}
+	var creatorPollData struct {
+		Status string `json:"status"`
+	}
+	_ = json.NewDecoder(creatorPollResp.Body).Decode(&creatorPollData)
+	if creatorPollData.Status != "closing" {
+		t.Fatalf("expected creator poll status 'closing', got %v", creatorPollData.Status)
+	}
+
+	// 6. During CLOSING: Participant cannot upload files
+	uploadReq := createMultipartRequest(t, ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/files", "file", "test.txt", []byte("hello"))
+	uploadReq.RequestURI = ""
+	uploadResp, err := http.DefaultClient.Do(uploadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uploadResp.Body.Close()
+	if uploadResp.StatusCode != http.StatusConflict && uploadResp.StatusCode != http.StatusGone {
+		t.Fatalf("expected 409 or 410 for upload during closing, got %d", uploadResp.StatusCode)
+	}
+
+	// 7. Transition deadline to the past to simulate 10s expiration
+	pastDeadline := time.Now().UTC().Add(-1 * time.Second).Format(time.RFC3339)
+	_, err = a.db.Exec("UPDATE rooms SET close_deadline = ? WHERE id = ?", pastDeadline, roomData.RoomID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 8. Creator polling detects room is CLOSED (410 Gone)
+	creatorPollResp2, err := http.Get(ts.URL + "/api/v1/rooms/" + roomData.CreatorToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer creatorPollResp2.Body.Close()
+	if creatorPollResp2.StatusCode != http.StatusGone {
+		t.Fatalf("expected 410 Gone for creator poll after deadline, got %d", creatorPollResp2.StatusCode)
+	}
+
+	// 9. Participant polling detects room is CLOSED (410 Gone)
+	partPollResp, err := http.Get(ts.URL + "/api/v1/rooms/" + roomData.ParticipantToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer partPollResp.Body.Close()
+	if partPollResp.StatusCode != http.StatusGone {
+		t.Fatalf("expected 410 Gone for participant poll after deadline, got %d", partPollResp.StatusCode)
+	}
+
+	// 10. Calling close on already closed room returns status: "closed" safely
+	closedCloseResp, err := http.Post(ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/close", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closedCloseResp.Body.Close()
+	if closedCloseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for close on already closed room, got %d", closedCloseResp.StatusCode)
+	}
+	var closedCloseResult struct {
+		Status string `json:"status"`
+	}
+	_ = json.NewDecoder(closedCloseResp.Body).Decode(&closedCloseResult)
+	if closedCloseResult.Status != "closed" {
+		t.Fatalf("expected status 'closed', got %v", closedCloseResult.Status)
+	}
+}
+
+func TestParticipantCloseRoomPINProtection(t *testing.T) {
+	a := testApp(t)
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	// 1. Creator creates PIN protected room
+	createResp, err := http.Post(ts.URL+"/api/v1/rooms", "application/json", strings.NewReader(`{"ttl_seconds": 3600, "pin": "8888"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createResp.Body.Close()
+
+	var roomData struct {
+		RoomID           string `json:"room_id"`
+		ParticipantToken string `json:"participant_token"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&roomData); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Unauthenticated participant cannot close PIN protected room
+	unauthCloseResp, err := http.Post(ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/close", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unauthCloseResp.Body.Close()
+	if unauthCloseResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when closing PIN room without auth, got %d", unauthCloseResp.StatusCode)
+	}
+
+	// 3. Authenticate with PIN
+	pinReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/auth/pin", strings.NewReader(`{"pin": "8888"}`))
+	pinReq.Header.Set("Content-Type", "application/json")
+	pinResp, err := http.DefaultClient.Do(pinReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinResp.Body.Close()
+	if pinResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on PIN auth, got %d", pinResp.StatusCode)
+	}
+
+	var sessionCookie *http.Cookie
+	for _, c := range pinResp.Cookies() {
+		if strings.HasPrefix(c.Name, "landrop_session_") {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("expected session cookie")
+	}
+
+	// 4. Authenticated participant can now close the room
+	authCloseReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/close", nil)
+	authCloseReq.AddCookie(sessionCookie)
+	authCloseResp, err := http.DefaultClient.Do(authCloseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authCloseResp.Body.Close()
+	if authCloseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 when authenticated participant closes room, got %d", authCloseResp.StatusCode)
+	}
+}
+
+func TestParticipantCannotCloseOtherRoomOrInvalid(t *testing.T) {
+	a := testApp(t)
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	// 1. Invalid token returns 404
+	invalidResp, err := http.Post(ts.URL+"/api/v1/rooms/invalid_token_12345/close", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer invalidResp.Body.Close()
+	if invalidResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for invalid token close, got %d", invalidResp.StatusCode)
+	}
+
+	// 2. Create Room A and Room B
+	createRespA, err := http.Post(ts.URL+"/api/v1/rooms", "application/json", strings.NewReader(`{"ttl_seconds": 3600}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createRespA.Body.Close()
+	var roomA struct {
+		ParticipantToken string `json:"participant_token"`
+	}
+	_ = json.NewDecoder(createRespA.Body).Decode(&roomA)
+
+	createRespB, err := http.Post(ts.URL+"/api/v1/rooms", "application/json", strings.NewReader(`{"ttl_seconds": 3600}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createRespB.Body.Close()
+	var roomB struct {
+		CreatorToken string `json:"creator_token"`
+	}
+	_ = json.NewDecoder(createRespB.Body).Decode(&roomB)
+
+	// Close room A with participant A token
+	closeAResp, err := http.Post(ts.URL+"/api/v1/rooms/"+roomA.ParticipantToken+"/close", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAResp.Body.Close()
+	if closeAResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 closing room A, got %d", closeAResp.StatusCode)
+	}
+
+	// Verify Room B is still active
+	pollBResp, err := http.Get(ts.URL + "/api/v1/rooms/" + roomB.CreatorToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pollBResp.Body.Close()
+	if pollBResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected room B to remain 200 active, got %d", pollBResp.StatusCode)
+	}
+}
