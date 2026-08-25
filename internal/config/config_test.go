@@ -179,3 +179,83 @@ func TestValidateDBPathEnforcesDataDirContainment(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadFromEnvHamalPrefix(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("HAMAL_LISTEN_ADDR", ":8800")
+	t.Setenv("HAMAL_DATA_DIR", dataDir)
+	t.Setenv("HAMAL_MAX_FILE_SIZE", "128MiB")
+	t.Setenv("HAMAL_DEFAULT_TTL", "45m")
+	t.Setenv("HAMAL_CLEANUP_BATCH_SIZE", "30")
+	t.Setenv("HAMAL_LOG_LEVEL", "debug")
+	t.Setenv("HAMAL_LOG_FORMAT", "text")
+	t.Setenv("HAMAL_TRUSTED_PROXIES", "172.16.0.0/12")
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv failed: %v", err)
+	}
+	if cfg.ListenAddr != ":8800" {
+		t.Fatalf("expected ListenAddr ':8800', got %q", cfg.ListenAddr)
+	}
+	if cfg.DataDir != dataDir {
+		t.Fatalf("expected DataDir %q, got %q", dataDir, cfg.DataDir)
+	}
+	if cfg.MaxFileSize != 128<<20 {
+		t.Fatalf("expected MaxFileSize 128 MiB, got %d", cfg.MaxFileSize)
+	}
+	if cfg.DefaultTTL != 45*time.Minute {
+		t.Fatalf("expected DefaultTTL 45m, got %s", cfg.DefaultTTL)
+	}
+	if cfg.CleanupBatchSize != 30 {
+		t.Fatalf("expected CleanupBatchSize 30, got %d", cfg.CleanupBatchSize)
+	}
+	if cfg.LogLevel != "debug" {
+		t.Fatalf("expected LogLevel 'debug', got %q", cfg.LogLevel)
+	}
+	if cfg.LogFormat != "text" {
+		t.Fatalf("expected LogFormat 'text', got %q", cfg.LogFormat)
+	}
+	if len(cfg.TrustedProxies) != 1 || cfg.TrustedProxies[0] != "172.16.0.0/12" {
+		t.Fatalf("expected TrustedProxies ['172.16.0.0/12'], got %v", cfg.TrustedProxies)
+	}
+}
+
+func TestLoadFromEnvPrecedence(t *testing.T) {
+	dataDir := t.TempDir()
+	// When both HAMAL_* and LAN_DROP_* are present, HAMAL_* must take precedence
+	t.Setenv("HAMAL_DATA_DIR", dataDir)
+	t.Setenv("LAN_DROP_DATA_DIR", "/nonexistent/data/dir")
+
+	t.Setenv("HAMAL_LISTEN_ADDR", ":7701")
+	t.Setenv("LAN_DROP_LISTEN_ADDR", ":9999")
+
+	t.Setenv("HAMAL_MAX_FILE_SIZE", "2GiB")
+	t.Setenv("LAN_DROP_MAX_FILE_SIZE", "500MiB")
+
+	t.Setenv("HAMAL_LOG_LEVEL", "warn")
+	t.Setenv("LAN_DROP_LOG_LEVEL", "error")
+
+	// Test fallback when only LAN_DROP_* is provided
+	t.Setenv("LAN_DROP_DEFAULT_TTL", "2h")
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv failed: %v", err)
+	}
+	if cfg.ListenAddr != ":7701" {
+		t.Fatalf("expected HAMAL_LISTEN_ADDR ':7701' to take precedence over ':9999', got %q", cfg.ListenAddr)
+	}
+	if cfg.DataDir != dataDir {
+		t.Fatalf("expected HAMAL_DATA_DIR %q to take precedence, got %q", dataDir, cfg.DataDir)
+	}
+	if cfg.MaxFileSize != 2<<30 {
+		t.Fatalf("expected HAMAL_MAX_FILE_SIZE 2 GiB to take precedence, got %d", cfg.MaxFileSize)
+	}
+	if cfg.LogLevel != "warn" {
+		t.Fatalf("expected HAMAL_LOG_LEVEL 'warn' to take precedence, got %q", cfg.LogLevel)
+	}
+	if cfg.DefaultTTL != 2*time.Hour {
+		t.Fatalf("expected fallback LAN_DROP_DEFAULT_TTL '2h', got %s", cfg.DefaultTTL)
+	}
+}

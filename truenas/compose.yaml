@@ -1,18 +1,46 @@
+# ==============================================================================
+# HAMAL for TrueNAS SCALE (24.10 "Electric Eel" or later)
+# Deployment via TrueNAS WebUI: Apps -> Discover Apps -> (⋮) -> Install via YAML
+# ==============================================================================
+
 services:
   hamal:
     image: ghcr.io/i1k3r/hamal-truenas:latest
+    container_name: hamal
     restart: unless-stopped
+
+    # --- Security Hardening ---
     read_only: true
     user: "10001:10001"
     security_opt:
       - no-new-privileges:true
+
+    # --- Networking / WebUI Port ---
+    # Default port is 7700. To use a different host port, change the left-hand side (e.g., "7701:7700").
     ports:
       - "${HAMAL_PORT:-7700}:7700"
+
+    # --- Storage & Dataset Permissions ---
+    # IMPORTANT: Replace /mnt/YOUR_POOL/appdata/hamal with your actual TrueNAS ZFS dataset path.
+    # CRITICAL: The dataset MUST grant Read & Write access to UID 10001 / GID 10001.
+    # In TrueNAS WebUI: Datasets -> hamal -> Edit Permissions / Edit ACL -> set User: 10001, Group: 10001.
     volumes:
-      # Replace /mnt/YOUR_POOL/appdata/hamal with the absolute path to your TrueNAS ZFS dataset.
-      # Ensure UID 10001 / GID 10001 has read and write permissions on this dataset.
       - ${HAMAL_DATA_PATH:-/mnt/YOUR_POOL/appdata/hamal}:/data
+
+    # --- In-Memory Volatile Temp Storage ---
     tmpfs:
       - /tmp:size=64M,mode=1777
+
+    # --- Optional Configuration ---
+    # All variables below are optional. Uncomment and adjust as needed.
     environment:
       - TZ=${TZ:-Europe/Istanbul}
+      # - HAMAL_BASE_URL=http://192.168.1.100:7700 # Explicit URL embedded in QR codes and share links
+      # - HAMAL_DEFAULT_TTL=1h                     # Default room lifespan (5m to 24h)
+      # - HAMAL_MAX_TTL=24h                        # Maximum room lifespan (e.g. 24h)
+      # - HAMAL_MAX_FILE_SIZE=10GiB                # Max individual file size (e.g. 10GiB, 500MiB)
+      # - HAMAL_MAX_ROOM_SIZE=10GiB                # Max aggregate storage per room
+      # - HAMAL_MAX_TOTAL_STORAGE=100GiB           # Global storage quota across all active rooms
+      # - HAMAL_MIN_FREE_SPACE=5GiB                # Minimum free storage required on dataset
+      # - HAMAL_LOG_LEVEL=info                     # Log level: debug, info, warn, error
+      # - HAMAL_LOG_FORMAT=json                    # Log format: json or text

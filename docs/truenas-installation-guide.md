@@ -28,27 +28,28 @@ Before deploying the container, create a dedicated dataset on your storage pool:
 
 ---
 
-## Step 2: Configure Dataset Permissions (WebUI)
+## Step 2: Configure Dataset Permissions (Crucial Step)
 
-> [!IMPORTANT]
-> Because HAMAL runs as unprivileged user `10001:10001`, the ZFS dataset mounted to `/data` **must grant write permissions to UID 10001 and GID 10001**. If permissions are not set, the application cannot create or update the SQLite database.
+> [!CAUTION]
+> **Creating a dataset is NOT enough.**
+> By default, newly created TrueNAS datasets are owned by `root:root` with restricted access. Because HAMAL runs as an unprivileged, non-root user (`UID 10001`, `GID 10001`), the host dataset mounted to `/data` **must explicitly grant write access to UID 10001 and GID 10001**.
+> If permissions are not configured, the container will fail on startup with `failed to open database: permission denied`.
 
 ### Recommended Method: TrueNAS WebUI Permissions / ACL Editor
 
-1. Navigate to **Datasets** and select your `hamal` dataset.
-2. In the **Permissions** card, click **Edit** (or **Set ACL** / **Edit ACL**).
-3. If using standard POSIX Permissions:
+1. In the TrueNAS WebUI, go to **Datasets** and select your `hamal` dataset.
+2. In the **Permissions** card on the right, click **Edit** (or **Set ACL** / **Edit ACL**).
+3. **If using standard POSIX Permissions**:
    * Set **User**: `10001` and check **Apply User**.
    * Set **Group**: `10001` and check **Apply Group**.
-   * Ensure **Read**, **Write**, and **Execute** are enabled for User and Group.
-4. If using an **NFSv4 / POSIX ACL**:
+   * Ensure **Read**, **Write**, and **Execute** checkboxes are checked for User and Group.
+4. **If using an NFSv4 / POSIX ACL**:
    * Click **Add Item** -> Who: **User** -> User: `10001` -> Permissions: **Full Control** (or Read + Write + Execute).
    * Click **Add Item** -> Who: **Group** -> Group: `10001` -> Permissions: **Full Control** (or Read + Write + Execute).
 5. Check **Apply permissions recursively** (and **Apply permissions to child datasets** if applicable).
 6. Click **Save Access Control List** / **Save**.
 
-*(Optional Alternative for Advanced Users via Shell)*:
-If configuring via TrueNAS CLI/SSH is preferred:
+*(Optional CLI Alternative via SSH / TrueNAS Shell)*:
 ```bash
 chown -R 10001:10001 /mnt/<pool_name>/appdata/hamal
 chmod -R 770 /mnt/<pool_name>/appdata/hamal
@@ -69,20 +70,30 @@ chmod -R 770 /mnt/<pool_name>/appdata/hamal
 services:
   hamal:
     image: ghcr.io/i1k3r/hamal-truenas:latest
+    container_name: hamal
     restart: unless-stopped
+
+    # Hardened unprivileged security
     read_only: true
     user: "10001:10001"
     security_opt:
       - no-new-privileges:true
+
     ports:
       - "7700:7700"
+
     volumes:
       # Replace /mnt/YOUR_POOL/appdata/hamal with your actual TrueNAS dataset path
       - /mnt/YOUR_POOL/appdata/hamal:/data
+
     tmpfs:
       - /tmp:size=64M,mode=1777
+
     environment:
       - TZ=Europe/Istanbul
+      # - HAMAL_BASE_URL=http://192.168.1.100:7700 # Optional: explicit LAN URL for QR codes
+      # - HAMAL_MAX_FILE_SIZE=10GiB                # Optional: max file upload limit
+      # - HAMAL_DEFAULT_TTL=1h                     # Optional: default room lifespan
 ```
 
 > [!NOTE]
