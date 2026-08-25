@@ -3560,3 +3560,136 @@ func TestParticipantCannotCloseOtherRoomOrInvalid(t *testing.T) {
 		t.Fatalf("expected room B to remain 200 active, got %d", pollBResp.StatusCode)
 	}
 }
+
+func TestParticipantPINAuthenticationFlowAndRedirect(t *testing.T) {
+	a := testApp(t)
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	// 1. Create a PIN-protected room with an 8-character PIN
+	createResp, err := http.Post(ts.URL+"/api/v1/rooms", "application/json", strings.NewReader(`{"ttl_seconds": 3600, "pin": "98765432"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createResp.Body.Close()
+
+	var roomData struct {
+		RoomID           string `json:"room_id"`
+		ParticipantToken string `json:"participant_token"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&roomData); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Request participant room without authentication -> displays PIN barrier
+	unauthResp, err := http.Get(ts.URL + "/r/" + roomData.ParticipantToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on unauthenticated participant page, got %d", unauthResp.StatusCode)
+	}
+	unauthBody, _ := io.ReadAll(unauthResp.Body)
+	unauthHTML := string(unauthBody)
+	if !strings.Contains(unauthHTML, "id=\"pin-form\"") {
+		t.Fatal("expected unauthenticated page to contain pin-form")
+	}
+	if !strings.Contains(unauthHTML, "id=\"participant-pin-input\"") {
+		t.Fatal("expected unauthenticated page to contain participant-pin-input")
+	}
+
+	// 3. Incorrect PIN fails with 401 Unauthorized
+	badReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/auth/pin", strings.NewReader(`{"pin": "00000000"}`))
+	badReq.Header.Set("Content-Type", "application/json")
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badResp.Body.Close()
+	if badResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on incorrect PIN, got %d", badResp.StatusCode)
+	}
+
+	// 4. Submit correct PIN via standard browser HTML form post (Accept: text/html) -> Redirects to /r/{token} (NOT raw JSON)
+	noRedirectClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	formReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/auth/pin", strings.NewReader("pin=98765432"))
+	formReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	formReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	formResp, err := noRedirectClient.Do(formReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer formResp.Body.Close()
+	if formResp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 SeeOther redirect on HTML form post, got %d", formResp.StatusCode)
+	}
+	loc := formResp.Header.Get("Location")
+	if loc != "/r/"+roomData.ParticipantToken {
+		t.Fatalf("expected redirect Location /r/%s, got %q", roomData.ParticipantToken, loc)
+	}
+
+	// 5. Submit correct PIN via JSON / AJAX -> returns 200 OK with session cookie
+	authReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/rooms/"+roomData.ParticipantToken+"/auth/pin", strings.NewReader(`{"pin": "98765432"}`))
+	authReq.Header.Set("Content-Type", "application/json")
+	authReq.Header.Set("Accept", "application/json")
+	authResp, err := http.DefaultClient.Do(authReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authResp.Body.Close()
+	if authResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on correct PIN, got %d", authResp.StatusCode)
+	}
+	var authData struct {
+		Status string `json:"status"`
+	}
+	_ = json.NewDecoder(authResp.Body).Decode(&authData)
+	if authData.Status != "authenticated" {
+		t.Fatalf("expected status authenticated, got %q", authData.Status)
+	}
+
+	var sessionCookie *http.Cookie
+	for _, c := range authResp.Cookies() {
+		if strings.HasPrefix(c.Name, "landrop_session_") {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("expected session cookie in response")
+	}
+
+	// 6. Request participant room WITH session cookie -> immediately renders unlocked room (not PIN barrier)
+	authViewReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/r/"+roomData.ParticipantToken, nil)
+	authViewReq.AddCookie(sessionCookie)
+	authViewResp, err := http.DefaultClient.Do(authViewReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authViewResp.Body.Close()
+	if authViewResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on authenticated participant view, got %d", authViewResp.StatusCode)
+	}
+	authViewBody, _ := io.ReadAll(authViewResp.Body)
+	authViewHTML := string(authViewBody)
+	if !strings.Contains(authViewHTML, "data-pin-authenticated=\"true\"") {
+		t.Fatalf("expected page to have data-pin-authenticated=true, got %s", authViewHTML)
+	}
+
+	// 7. Reopening participant room in new request with cookie succeeds
+	reopenReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/r/"+roomData.ParticipantToken, nil)
+	reopenReq.AddCookie(sessionCookie)
+	reopenResp, err := http.DefaultClient.Do(reopenReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenResp.Body.Close()
+	if reopenResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on reopen with cookie, got %d", reopenResp.StatusCode)
+	}
+}
